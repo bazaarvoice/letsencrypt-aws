@@ -1,154 +1,266 @@
 import datetime
 import json
+import logging
 import os
+import argparse
 import sys
+import textwrap
 import time
 
 import acme.challenges
 import acme.client
 import acme.jose
+import boto3
+import botocore.exceptions
+import dateutil.tz
+import OpenSSL.crypto
+import rfc3986
 
-import click
-
+from collections import namedtuple
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-
-import boto3
-
-import OpenSSL.crypto
-
-import rfc3986
+from retry import retry
 
 
-DEFAULT_ACME_DIRECTORY_URL = "https://acme-v01.api.letsencrypt.org/directory"
-CERTIFICATE_EXPIRATION_THRESHOLD = datetime.timedelta(days=45)
-# One day
-PERSISTENT_SLEEP_INTERVAL = 60 * 60 * 24
+logging.basicConfig(format='%(asctime)s %(name)s %(levelname)s %(message)s',
+                    level=logging.INFO)
+logger = logging.getLogger('letsencrypt-aws')
+logger.setLevel(logging.INFO)
+# Boto3 logs private keys during upload, so disable its INFO logs
+logging.getLogger('boto3').setLevel(logging.WARNING)
+
+DEFAULT_ACME_DIRECTORY_URL = 'https://acme-v01.api.letsencrypt.org/directory'
+STAGING_ACME_DIRECTORY_URL = \
+    'https://acme-staging.api.letsencrypt.org/directory'
+DEFAULT_ACME_PATH = '/acme/'
+DEFAULT_EXPIRATION_THRESHOLD = 45
 DNS_TTL = 30
 
-
-class Logger(object):
-    def __init__(self):
-        self._out = sys.stdout
-
-    def emit(self, event, **data):
-        formatted_data = " ".join(
-            "{}={!r}".format(k, v) for k, v in data.items()
-        )
-        self._out.write("{} [{}] {}\n".format(
-            datetime.datetime.utcnow().replace(microsecond=0),
-            event,
-            formatted_data
-        ))
-        self._out.flush()
+today = datetime.datetime.utcnow().replace(tzinfo=dateutil.tz.tzutc())
 
 
-def _get_iam_certificate(iam_client, certificate_id):
-    paginator = iam_client.get_paginator("list_server_certificates")
-    for page in paginator.paginate():
-        for server_certificate in page["ServerCertificateMetadataList"]:
-            if server_certificate["Arn"] == certificate_id:
-                cert_name = server_certificate["ServerCertificateName"]
-                response = iam_client.get_server_certificate(
-                    ServerCertificateName=cert_name,
-                )
-                return x509.load_pem_x509_certificate(
-                    response["ServerCertificate"]["CertificateBody"].encode(),
-                    default_backend(),
-                )
+def _get_expiring_certificates(iam,
+                               path,
+                               expiration_threshold):
+    for cert in iam.server_certificates.filter(PathPrefix=path):
+        renew_date = cert.server_certificate_metadata[
+            'Expiration'] - expiration_threshold
+        logger.info('Checking cert {}: Renew date: {} Now: {}'.format(
+            cert.name, renew_date, today))
+        if renew_date < today:
+            yield cert
 
 
-class CertificateRequest(object):
-    def __init__(self, cert_location, dns_challenge_completer, hosts,
-                 key_type):
-        self.cert_location = cert_location
-        self.dns_challenge_completer = dns_challenge_completer
+class ElbListener(object):
 
-        self.hosts = hosts
-        self.key_type = key_type
-
-
-class ELBCertificate(object):
-    def __init__(self, elb_client, iam_client, elb_name, elb_port):
-        self.elb_client = elb_client
-        self.iam_client = iam_client
+    def __init__(self, elb_client, elb_name, port):
+        self.client = elb_client
         self.elb_name = elb_name
-        self.elb_port = elb_port
+        self.port = port
 
-    def get_current_certificate(self):
-        response = self.elb_client.describe_load_balancers(
-            LoadBalancerNames=[self.elb_name]
+    @retry(tries=5, delay=5, backoff=2)
+    def update_cert(self, cert_arn):
+        self.client.set_load_balancer_listener_ssl_certificate(
+            LoadBalancerName=self.elb_name,
+            LoadBalancerPort=self.port,
+            SSLCertificateId=cert_arn)
+
+
+def _get_elb_listeners_for_cert(elb_client, *cert_arns):
+    for page in elb_client.get_paginator('describe_load_balancers').paginate():
+        for elb in page['LoadBalancerDescriptions']:
+            for description in elb['ListenerDescriptions']:
+                listener = description['Listener']
+                ssl_cert_arn = listener.get('SSLCertificateId')
+                if ssl_cert_arn in cert_arns:
+                    yield ElbListener(elb_client,
+                                      elb['LoadBalancerName'],
+                                      listener['LoadBalancerPort'])
+
+
+def _change_elb_cert(old_cert, new_cert, regions):
+    elb_clients = {region: boto3.client(
+        'elb', region_name=region) for region in regions}
+    old_arn = _get_cert_arn(old_cert)
+    new_arn = _get_cert_arn(new_cert)
+    for region in regions:
+        # Sometimes the API takes a bit to catch up,
+        # so look for ELBs with either ARN
+        for elb_listener in _get_elb_listeners_for_cert(elb_clients[region],
+                                                        old_arn,
+                                                        new_arn):
+            logger.info('Updating elb: {} with cert: {}'.format(
+                elb_listener.elb_name, new_arn))
+            elb_listener.update_cert(new_arn)
+
+
+def _get_domains_for_cert(cert_body):
+    cert = x509.load_pem_x509_certificate(cert_body, default_backend())
+    try:
+        san_extension = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
         )
-        [description] = response["LoadBalancerDescriptions"]
-        [elb_listener] = [
-            listener["Listener"]
-            for listener in description["ListenerDescriptions"]
-            if listener["Listener"]["LoadBalancerPort"] == self.elb_port
-        ]
+    except x509.ExtensionNotFound:
+        # Handle the case where an old certificate doesn't have a SAN
+        domains = [name.value for name in cert.subject]
+    else:
+        domains = san_extension.value.get_values_for_type(
+            x509.DNSName
+        )
+    return domains
 
-        if "SSLCertificateId" not in elb_listener:
-            raise ValueError(
-                "A certificate must already be configured for the ELB"
+
+Certificate = namedtuple('Certificate', ['name', 'key', 'cert_body', 'chain'])
+
+
+def _provision_cert(name, hosts, acme_client, dns_challenge_completer):
+    private_key = generate_rsa_private_key()
+    csr = generate_csr(private_key, hosts)
+
+    authorizations = []
+    try:
+        for host in hosts:
+            authz_record = start_dns_challenge(
+                acme_client, dns_challenge_completer,
+                host,
+            )
+            authorizations.append(authz_record)
+
+        for authz_record in authorizations:
+            complete_dns_challenge(
+                acme_client, dns_challenge_completer,
+                authz_record
             )
 
-        return _get_iam_certificate(
-            self.iam_client, elb_listener["SSLCertificateId"]
+        logger.info('Requesting {} cert'.format(name))
+        pem_certificate, pem_certificate_chain = request_certificate(
+            acme_client, authorizations, csr
         )
 
-    def update_certificate(self, logger, hosts, private_key, pem_certificate,
-                           pem_certificate_chain):
-        logger.emit(
-            "updating-elb.upload-iam-certificate", elb_name=self.elb_name
-        )
+    finally:
+        for authz_record in authorizations:
+            logger.info('Deleting {} txt records'.format(authz_record.host))
+            dns_challenge = authz_record.dns_challenge
+            dns_challenge_completer.delete_txt_record(
+                authz_record.change_id,
+                dns_challenge.validation_domain_name(authz_record.host),
+                dns_challenge.validation(acme_client.key),
+            )
+    private_key_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption())
+    return Certificate(name,
+                       private_key_bytes,
+                       pem_certificate,
+                       pem_certificate_chain)
 
-        response = self.iam_client.upload_server_certificate(
-            ServerCertificateName=generate_certificate_name(
-                hosts,
-                x509.load_pem_x509_certificate(
-                    pem_certificate, default_backend()
-                )
-            ),
-            PrivateKey=private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            ),
-            CertificateBody=pem_certificate.decode(),
-            CertificateChain=pem_certificate_chain.decode(),
-        )
-        new_cert_arn = response["ServerCertificateMetadata"]["Arn"]
 
-        # Sleep before trying to set the certificate, it appears to sometimes
-        # fail without this.
-        time.sleep(15)
-        logger.emit("updating-elb.set-elb-certificate", elb_name=self.elb_name)
-        self.elb_client.set_load_balancer_listener_ssl_certificate(
-            LoadBalancerName=self.elb_name,
-            SSLCertificateId=new_cert_arn,
-            LoadBalancerPort=self.elb_port,
-        )
+def _upload_cert(cert, iam, path='/'):
+    return iam.create_server_certificate(
+        Path=path,
+        ServerCertificateName=cert.name,
+        CertificateBody=cert.cert_body,
+        PrivateKey=cert.key,
+        CertificateChain=cert.chain
+    )
+
+
+def _get_cert_arn(cert):
+    return cert.server_certificate_metadata['Arn']
+
+
+def _write_cert(cert):
+    with open(cert.name + '.key', 'w') as key:
+        key.write(cert.key)
+    with open(cert.name + '.crt', 'w') as crt:
+        crt.write(cert.cert_body)
+    with open(cert.name + '.chain', 'w') as chain:
+        chain.write(cert.chain)
+
+
+def _read_cert_from_disk(name):
+    with open(name + '.key') as key:
+        private_key = key.read()
+    with open(name + '.crt') as crt:
+        cert_body = crt.read()
+    with open(name + '.chain') as chain:
+        cert_chain = chain.read()
+    return Certificate(name, private_key, cert_body, cert_chain)
+
+
+def create(acme_client,
+           route53_client,
+           hosts,
+           path,
+           name,
+           save_local_copy=False):
+    iam = boto3.resource('iam')
+    challenge_completer = Route53ChallengeCompleter(route53_client)
+    logger.info('Creating certificate: {}'.format(name))
+    new_cert = _provision_cert(
+        name, hosts, acme_client, challenge_completer)
+    if(save_local_copy):
+        logger.info('Saving certificate {} to disk'.format(name))
+        _write_cert(new_cert)
+    logger.info('Uploading new {} certificate'.format(name))
+    _upload_cert(new_cert, iam, path)
+
+
+def update(acme_client,
+           route53_client,
+           path,
+           expiration_threshold,
+           regions,
+           read_local_copy=False,
+           save_local_copy=False):
+    iam = boto3.resource('iam')
+    challenge_completer = Route53ChallengeCompleter(route53_client)
+    for cert in _get_expiring_certificates(iam, path, expiration_threshold):
+        if read_local_copy:
+            logger.info('Reading cert {} from disk'.format(cert.name))
+            new_cert = _read_cert_from_disk(cert.name)
+        else:
+            logger.info('Renewing certificate: {}'.format(cert.name))
+            hosts = _get_domains_for_cert(cert.certificate_body)
+            new_cert = _provision_cert(
+                cert.name, hosts, acme_client, challenge_completer)
+        if(save_local_copy):
+            logger.info('Saving certificate {} to disk'.format(cert.name))
+            _write_cert(new_cert)
+        logger.info('Renaming {} certificate'.format(cert.name))
+        old_cert = cert.update(NewServerCertificateName=cert.name + '-old')
+        logger.info('Uploading renewed {} certificate'.format(cert.name))
+        renewed_cert = _upload_cert(new_cert, iam, path)
+        logger.info('Finding ELBs with cert {}'.format(old_cert))
+        _change_elb_cert(old_cert, renewed_cert, regions)
+        logger.info('Deleting old certificate: {}'.format(old_cert.name))
+        old_cert.delete()
+        logger.info('Done renewing certificate: {}'.format(cert.name))
 
 
 class Route53ChallengeCompleter(object):
+
     def __init__(self, route53_client):
         self.route53_client = route53_client
 
     def _find_zone_id_for_domain(self, domain):
-        paginator = self.route53_client.get_paginator("list_hosted_zones")
+        paginator = self.route53_client.get_paginator('list_hosted_zones')
         zones = []
         for page in paginator.paginate():
-            for zone in page["HostedZones"]:
+            for zone in page['HostedZones']:
+                subdomain = '.' + zone['Name']
                 if (
-                    domain.endswith(zone["Name"]) or
-                    (domain + ".").endswith(zone["Name"])
-                ) and not zone["Config"]["PrivateZone"]:
-                    zones.append((zone["Name"], zone["Id"]))
+                    domain.endswith(subdomain) or
+                    (domain + '.').endswith(subdomain)
+                ) and not zone['Config']['PrivateZone']:
+                    zones.append((zone['Name'], zone['Id']))
 
         if not zones:
             raise ValueError(
-                "Unable to find a Route53 hosted zone for {}".format(domain)
+                'Unable to find a Route53 hosted zone for {}'.format(domain)
             )
 
         # Order the zones that are suffixes for our desired to domain by
@@ -162,29 +274,29 @@ class Route53ChallengeCompleter(object):
         response = self.route53_client.change_resource_record_sets(
             HostedZoneId=zone_id,
             ChangeBatch={
-                "Changes": [
+                'Changes': [
                     {
-                        "Action": action,
-                        "ResourceRecordSet": {
-                            "Name": domain,
-                            "Type": "TXT",
-                            "TTL": DNS_TTL,
-                            "ResourceRecords": [
+                        'Action': action,
+                        'ResourceRecordSet': {
+                            'Name': domain,
+                            'Type': 'TXT',
+                            'TTL': DNS_TTL,
+                            'ResourceRecords': [
                                 # For some reason TXT records need to be
                                 # manually quoted.
-                                {"Value": '"{}"'.format(value)}
+                                {'Value': '"{}"'.format(value)}
                             ],
                         }
                     }
                 ]
             }
         )
-        return response["ChangeInfo"]["Id"]
+        return response['ChangeInfo']['Id']
 
     def create_txt_record(self, host, value):
         zone_id = self._find_zone_id_for_domain(host)
         change_id = self._change_txt_record(
-            "CREATE",
+            'CREATE',
             zone_id,
             host,
             value,
@@ -194,7 +306,7 @@ class Route53ChallengeCompleter(object):
     def delete_txt_record(self, change_id, host, value):
         zone_id, _ = change_id
         self._change_txt_record(
-            "DELETE",
+            'DELETE',
             zone_id,
             host,
             value
@@ -205,7 +317,7 @@ class Route53ChallengeCompleter(object):
 
         while True:
             response = self.route53_client.get_change(Id=change_id)
-            if response["ChangeInfo"]["Status"] == "INSYNC":
+            if response['ChangeInfo']['Status'] == 'INSYNC':
                 return
             time.sleep(5)
 
@@ -247,14 +359,15 @@ def find_dns_challenge(authz):
 
 
 def generate_certificate_name(hosts, cert):
-    return "{serial}-{expiration}-{hosts}".format(
+    return '{serial}-{expiration}-{hosts}'.format(
         serial=cert.serial,
         expiration=cert.not_valid_after.date(),
-        hosts="-".join(h.replace(".", "_") for h in hosts),
+        hosts='-'.join(h.replace('.', '_') for h in hosts),
     )[:128]
 
 
 class AuthorizationRecord(object):
+
     def __init__(self, host, authz, dns_challenge, change_id):
         self.host = host
         self.authz = authz
@@ -262,20 +375,15 @@ class AuthorizationRecord(object):
         self.change_id = change_id
 
 
-def start_dns_challenge(logger, acme_client, dns_challenge_completer,
-                        elb_name, host):
-    logger.emit(
-        "updating-elb.request-acme-challenge", elb_name=elb_name, host=host
-    )
+def start_dns_challenge(acme_client, dns_challenge_completer, host):
+    logger.info('Start {} DNS challenge'.format(host))
     authz = acme_client.request_domain_challenges(
         host, acme_client.directory.new_authz
     )
 
     [dns_challenge] = find_dns_challenge(authz)
 
-    logger.emit(
-        "updating-elb.create-txt-record", elb_name=elb_name, host=host
-    )
+    logger.info('Creating TXT record for {}'.format(host))
     change_id = dns_challenge_completer.create_txt_record(
         dns_challenge.validation_domain_name(host),
         dns_challenge.validation(acme_client.key),
@@ -289,37 +397,26 @@ def start_dns_challenge(logger, acme_client, dns_challenge_completer,
     )
 
 
-def complete_dns_challenge(logger, acme_client, dns_challenge_completer,
-                           elb_name, authz_record):
-    logger.emit(
-        "updating-elb.wait-for-route53",
-        elb_name=elb_name, host=authz_record.host
-    )
+def complete_dns_challenge(acme_client, dns_challenge_completer,
+                           authz_record):
     dns_challenge_completer.wait_for_change(authz_record.change_id)
 
     response = authz_record.dns_challenge.response(acme_client.key)
 
-    logger.emit(
-        "updating-elb.local-validation",
-        elb_name=elb_name, host=authz_record.host
-    )
+    logger.info('Validating {} challenge'.format(authz_record.host))
     verified = response.simple_verify(
         authz_record.dns_challenge.chall,
         authz_record.host,
         acme_client.key.public_key()
     )
     if not verified:
-        raise ValueError("Failed verification")
+        raise ValueError('Failed verification')
 
-    logger.emit(
-        "updating-elb.answer-challenge",
-        elb_name=elb_name, host=authz_record.host
-    )
+    logger.info('Answering {} challenge'.format(authz_record.host))
     acme_client.answer_challenge(authz_record.dns_challenge, response)
 
 
-def request_certificate(logger, acme_client, elb_name, authorizations, csr):
-    logger.emit("updating-elb.request-cert", elb_name=elb_name)
+def request_certificate(acme_client, authorizations, csr):
     cert_response, _ = acme_client.poll_and_request_issuance(
         acme.jose.util.ComparableX509(
             OpenSSL.crypto.load_certificate_request(
@@ -339,104 +436,9 @@ def request_certificate(logger, acme_client, elb_name, authorizations, csr):
     return pem_certificate, pem_certificate_chain
 
 
-def update_cert(logger, acme_client, force_issue, cert_request):
-    logger.emit("updating-elb", elb_name=cert_request.cert_location.elb_name)
-
-    current_cert = cert_request.cert_location.get_current_certificate()
-    if current_cert is not None:
-        logger.emit(
-            "updating-elb.certificate-expiration",
-            elb_name=cert_request.cert_location.elb_name,
-            expiration_date=current_cert.not_valid_after
-        )
-        days_until_expiration = (
-            current_cert.not_valid_after - datetime.datetime.today()
-        )
-
-        try:
-            san_extension = current_cert.extensions.get_extension_for_class(
-                x509.SubjectAlternativeName
-            )
-        except x509.ExtensionNotFound:
-            # Handle the case where an old certificate doesn't have a SAN
-            # extension and always reissue in that case.
-            current_domains = []
-        else:
-            current_domains = san_extension.value.get_values_for_type(
-                x509.DNSName
-            )
-
-        if (
-            days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
-            # If the set of hosts we want for our certificate changes, we
-            # update even if the current certificate isn't expired.
-            sorted(current_domains) == sorted(cert_request.hosts) and
-            not force_issue
-        ):
-            return
-
-    if cert_request.key_type == "rsa":
-        private_key = generate_rsa_private_key()
-    elif cert_request.key_type == "ecdsa":
-        private_key = generate_ecdsa_private_key()
-    else:
-        raise ValueError(
-            "Invalid key_type: {!r}".format(cert_request.key_type)
-        )
-    csr = generate_csr(private_key, cert_request.hosts)
-
-    authorizations = []
-    try:
-        for host in cert_request.hosts:
-            authz_record = start_dns_challenge(
-                logger, acme_client, cert_request.dns_challenge_completer,
-                cert_request.cert_location.elb_name, host,
-            )
-            authorizations.append(authz_record)
-
-        for authz_record in authorizations:
-            complete_dns_challenge(
-                logger, acme_client, cert_request.dns_challenge_completer,
-                cert_request.cert_location.elb_name, authz_record
-            )
-
-        pem_certificate, pem_certificate_chain = request_certificate(
-            logger, acme_client, cert_request.cert_location.elb_name,
-            authorizations, csr
-        )
-
-        cert_request.cert_location.update_certificate(
-            logger, cert_request.hosts,
-            private_key, pem_certificate, pem_certificate_chain
-        )
-    finally:
-        for authz_record in authorizations:
-            logger.emit(
-                "updating-elb.delete-txt-record",
-                elb_name=cert_request.cert_location.elb_name,
-                host=authz_record.host
-            )
-            dns_challenge = authz_record.dns_challenge
-            cert_request.dns_challenge_completer.delete_txt_record(
-                authz_record.change_id,
-                dns_challenge.validation_domain_name(authz_record.host),
-                dns_challenge.validation(acme_client.key),
-            )
-
-
-def update_certs(logger, acme_client, force_issue, certificate_requests):
-    for cert_request in certificate_requests:
-        update_cert(
-            logger,
-            acme_client,
-            force_issue,
-            cert_request,
-        )
-
-
 def setup_acme_client(s3_client, acme_directory_url, acme_account_key):
     uri = rfc3986.urlparse(acme_account_key)
-    if uri.scheme == "file":
+    if uri.scheme == 'file' or uri.scheme is None:
         if uri.host is None:
             path = uri.path
         elif uri.path is None:
@@ -445,13 +447,13 @@ def setup_acme_client(s3_client, acme_directory_url, acme_account_key):
             path = os.path.join(uri.host, uri.path)
         with open(path) as f:
             key = f.read()
-    elif uri.scheme == "s3":
+    elif uri.scheme == 's3':
         # uri.path includes a leading "/"
         response = s3_client.get_object(Bucket=uri.host, Key=uri.path[1:])
-        key = response["Body"].read()
+        key = response['Body'].read()
     else:
         raise ValueError(
-            "Invalid acme account key: {!r}".format(acme_account_key)
+            'Invalid acme account key: {!r}'.format(acme_account_key)
         )
 
     key = serialization.load_pem_private_key(
@@ -467,105 +469,16 @@ def acme_client_for_private_key(acme_directory_url, private_key):
     )
 
 
-@click.group()
-def cli():
-    pass
-
-
-@cli.command(name="update-certificates")
-@click.option(
-    "--persistent", is_flag=True, help="Runs in a loop, instead of just once."
-)
-@click.option(
-    "--force-issue", is_flag=True, help=(
-        "Issue a new certificate, even if the old one isn't close to "
-        "expiration."
-    )
-)
-def update_certificates(persistent=False, force_issue=False):
-    logger = Logger()
-    logger.emit("startup")
-
-    if persistent and force_issue:
-        raise ValueError("Can't specify both --persistent and --force-issue")
-
-    session = boto3.Session()
-    s3_client = session.client("s3")
-    elb_client = session.client("elb")
-    route53_client = session.client("route53")
-    iam_client = session.client("iam")
-
-    config = json.loads(os.environ["LETSENCRYPT_AWS_CONFIG"])
-    domains = config["domains"]
-    acme_directory_url = config.get(
-        "acme_directory_url", DEFAULT_ACME_DIRECTORY_URL
-    )
-    acme_account_key = config["acme_account_key"]
-    acme_client = setup_acme_client(
-        s3_client, acme_directory_url, acme_account_key
-    )
-
-    certificate_requests = []
-    for domain in domains:
-        if "elb" in domain:
-            cert_location = ELBCertificate(
-                elb_client, iam_client,
-                domain["elb"]["name"], int(domain["elb"].get("port", 443))
-            )
-        else:
-            raise ValueError(
-                "Unknown certificate location: {!r}".format(domain)
-            )
-
-        certificate_requests.append(CertificateRequest(
-            cert_location,
-            Route53ChallengeCompleter(route53_client),
-            domain["hosts"],
-            domain.get("key_type", "rsa"),
-        ))
-
-    if persistent:
-        logger.emit("running", mode="persistent")
-        while True:
-            update_certs(
-                logger, acme_client,
-                force_issue, certificate_requests
-            )
-            # Sleep before we check again
-            logger.emit("sleeping", duration=PERSISTENT_SLEEP_INTERVAL)
-            time.sleep(PERSISTENT_SLEEP_INTERVAL)
-    else:
-        logger.emit("running", mode="single")
-        update_certs(
-            logger, acme_client,
-            force_issue, certificate_requests
-        )
-
-
-@cli.command()
-@click.argument("email")
-@click.option(
-    "--out",
-    type=click.File("w"),
-    default="-",
-    help="Where to write the private key to. Defaults to stdout."
-)
-def register(email, out):
-    logger = Logger()
-    config = json.loads(os.environ.get("LETSENCRYPT_AWS_CONFIG", "{}"))
-    acme_directory_url = config.get(
-        "acme_directory_url", DEFAULT_ACME_DIRECTORY_URL
-    )
-
-    logger.emit("acme-register.generate-key")
+def register(email, out, acme_directory_url=DEFAULT_ACME_DIRECTORY_URL):
+    logger.info('acme-register.generate-key')
     private_key = generate_rsa_private_key()
     acme_client = acme_client_for_private_key(acme_directory_url, private_key)
 
-    logger.emit("acme-register.register", email=email)
+    logger.info('acme-register.register')
     registration = acme_client.register(
         acme.messages.NewRegistration.from_data(email=email)
     )
-    logger.emit("acme-register.agree-to-tos")
+    logger.info('acme-register.agree-to-tos')
     acme_client.agree_to_tos(registration)
     out.write(private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -574,5 +487,166 @@ def register(email, out):
     ))
 
 
-if __name__ == "__main__":
-    cli()
+def build_register_parser(parser):
+    parser.add_argument(
+        '--email',
+        required=True,
+        help="e-mail address to register Let's Encrypt account for.",
+    )
+    parser.add_argument(
+        '--out',
+        help='File to write the new private key to. Default: - (stdout)',
+        type=argparse.FileType('w'),
+        default='-',
+    )
+    add_acme_url_args(parser)
+    parser.set_defaults(
+        func=lambda args: register(args.email, args.key, args.acme_url))
+
+
+def build_create_parser(parser):
+    add_cert_args(parser)
+    parser.add_argument(
+        '--domains',
+        nargs='+',
+        required=True,
+        help='Domains to include in the cert.'
+    )
+    parser.add_argument(
+        '--name',
+        help=textwrap.dedent('''
+            Name for uploaded cert.
+            Default: First domain specified, with dashes in place of dots.
+            '''),
+    )
+
+    def create_command(args):
+        s3_client = boto3.client('s3')
+        acme_client = setup_acme_client(s3_client, args.acme_url, args.key)
+        route53_session = boto3.session.Session(
+            profile_name=args.route53_profile)
+        route53_client = route53_session.client('route53')
+        create(acme_client=acme_client,
+               route53_client=route53_client,
+               hosts=args.domains,
+               path=args.path,
+               name=args.name or args.domains[0].replace('.', '-'),
+               save_local_copy=args.save_local_certs,
+               )
+    parser.set_defaults(func=create_command)
+
+
+def build_update_parser(parser):
+    add_cert_args(parser)
+    parser.add_argument(
+        '--expiration-threshold',
+        help=textwrap.dedent('''
+            How many days from expiration to replace certs.
+            Default: %(default)s
+            '''),
+        default=DEFAULT_EXPIRATION_THRESHOLD,
+    )
+    parser.add_argument(
+        '--regions',
+        nargs='*',
+        help='Regions to update ELBs in.',
+        default=['us-east-1', 'us-west-2', 'eu-west-1'],
+    )
+    parser.add_argument(
+        '--local-certs',
+        action='store_true',
+        help=textwrap.dedent('''
+            Read certs from disk rather than provisioning new ones.
+            Useful when reusing certs from a previous --save-local-certs run.
+            Certs should be in the working directory with filenames like
+            ${name}.{key,crt,chain}
+            '''),
+    )
+
+    def update_command(args):
+        s3_client = boto3.client('s3')
+        acme_client = setup_acme_client(s3_client, args.acme_url, args.key)
+        route53_session = boto3.session.Session(
+            profile_name=args.route53_profile)
+        route53_client = route53_session.client('route53')
+        update(acme_client=acme_client,
+               route53_client=route53_client,
+               path=args.path,
+               expiration_threshold=datetime.timedelta(
+                   days=args.expiration_threshold),
+               regions=args.regions,
+               read_local_copy=args.use_local_certs,
+               save_local_copy=args.save_local_certs,
+               )
+    parser.set_defaults(func=update_command)
+
+
+def add_acme_url_args(parser):
+    url_group = parser.add_mutually_exclusive_group()
+    url_group.add_argument(
+        '--acme-url',
+        help='ACME directory URL. Default: %(default)s',
+        default=DEFAULT_ACME_DIRECTORY_URL,
+    )
+    url_group.add_argument(
+        '--staging',
+        dest='acme_url',
+        action='store_const',
+        const=STAGING_ACME_DIRECTORY_URL,
+        help=textwrap.dedent('''
+            Use the Let's Encrypt staging API.
+            Only do this for testing, not with live certs.
+            ''')
+        )
+
+
+def add_cert_args(parser):
+    parser.add_argument(
+        '--key',
+        required=True,
+        help="Let's Encrypt account key. Can be a local file or S3 URL.",
+    )
+    parser.add_argument(
+        '--path',
+        help="IAM path for Let's Encrypt certs. Default: %(default)s",
+        default=DEFAULT_ACME_PATH,
+    )
+    parser.add_argument(
+        '--route53-profile',
+        help='AWS profile to use for Route53 actions.',
+    )
+    parser.add_argument(
+        '--save-local-certs',
+        action='store_true',
+        help=textwrap.dedent('''
+            Save a copy of new certs to disk.
+            Files will be named ${name}.{key,crt,chain}
+            '''),
+    )
+    add_acme_url_args(parser)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers()
+    register_parser = subparsers.add_parser(
+        'register',
+        description="Register a Let's Encrypt account",
+    )
+    build_register_parser(register_parser)
+    create_parser = subparsers.add_parser(
+        'create',
+        description="Create a new cert and upload it to IAM."
+    )
+    build_create_parser(create_parser)
+    update_parser = subparsers.add_parser(
+        'update',
+        description='Update certs that will expire soon.',
+    )
+    build_update_parser(update_parser)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
