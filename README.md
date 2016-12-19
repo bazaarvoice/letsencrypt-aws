@@ -88,8 +88,8 @@ $ python letsencrypt-aws.py update --key lets-encrypt.pem
 2016-12-14 14:41:44,315 INFO Answering example.com challenge
 2016-12-14 14:41:46,543 INFO Requesting example-com cert
 2016-12-14 14:41:47,628 INFO Deleting example.com txt records
-2016-12-14 14:41:48,776 INFO Renaming star-sta-bazaarvoice-com certificate
-2016-12-14 14:41:48,964 INFO Uploading renewed star-sta-bazaarvoice-com certificate
+2016-12-14 14:41:48,776 INFO Renaming example-com certificate
+2016-12-14 14:41:48,964 INFO Uploading renewed example-com certificate
 2016-12-14 14:41:53,156 INFO Finding ELBs with cert iam.ServerCertificate(name='example-com')
 2016-12-14 14:42:00,526 INFO Updating elb: example-elb with cert: arn:aws:iam::123456789012:server-certificate/acme/example-com
 2016-12-14 14:42:19,920 INFO Deleting old certificate: example-com
