@@ -550,7 +550,7 @@ def build_update_parser(parser):
         default=['us-east-1', 'us-west-2', 'eu-west-1'],
     )
     parser.add_argument(
-        '--local-certs',
+        '--use-local-certs',
         action='store_true',
         help=textwrap.dedent('''
             Read certs from disk rather than provisioning new ones.
