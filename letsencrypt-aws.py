@@ -462,7 +462,7 @@ def setup_acme_client(s3_client, acme_directory_url, acme_account_key):
 def acme_client_for_private_key(acme_directory_url, private_key):
     return acme.client.Client(
         # TODO: support EC keys, when josepy does.
-        acme_directory_url, key=josepyself.JWKRSA(key=private_key)
+        acme_directory_url, key=josepy.JWKRSA(key=private_key)
     )
 
 
