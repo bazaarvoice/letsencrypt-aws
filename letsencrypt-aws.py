@@ -231,6 +231,8 @@ def update(acme_client,
         old_cert = cert.update(NewServerCertificateName=cert.name + '-old')
         logger.info('Uploading renewed {} certificate'.format(cert.name))
         renewed_cert = _upload_cert(new_cert, iam, path)
+        time.sleep(10)
+        logger.info('Sleeping to wait for eventual consistency of IAM API')
         logger.info('Finding ELBs with cert {}'.format(old_cert))
         _change_elb_cert(old_cert, renewed_cert, regions)
         logger.info('Deleting old certificate: {}'.format(old_cert.name))
