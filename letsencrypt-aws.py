@@ -1,16 +1,13 @@
 import datetime
-import json
 import logging
 import os
 import argparse
-import sys
 import textwrap
 import time
 
 import acme.challenges
 import acme.client
 import boto3
-import botocore.exceptions
 import dateutil.tz
 import josepy
 import OpenSSL.crypto
@@ -464,8 +461,8 @@ def setup_acme_client(s3_client, acme_directory_url, acme_account_key):
 
 def acme_client_for_private_key(acme_directory_url, private_key):
     return acme.client.Client(
-        # TODO: support EC keys, when acme.jose does.
-        acme_directory_url, key=acme.jose.JWKRSA(key=private_key)
+        # TODO: support EC keys, when josepy does.
+        acme_directory_url, key=josepyself.JWKRSA(key=private_key)
     )
 
 
