@@ -9,10 +9,10 @@ import time
 
 import acme.challenges
 import acme.client
-import acme.jose
 import boto3
 import botocore.exceptions
 import dateutil.tz
+import josepy
 import OpenSSL.crypto
 import rfc3986
 
@@ -418,7 +418,7 @@ def complete_dns_challenge(acme_client, dns_challenge_completer,
 
 def request_certificate(acme_client, authorizations, csr):
     cert_response, _ = acme_client.poll_and_request_issuance(
-        acme.jose.util.ComparableX509(
+        josepy.util.ComparableX509(
             OpenSSL.crypto.load_certificate_request(
                 OpenSSL.crypto.FILETYPE_ASN1,
                 csr.public_bytes(serialization.Encoding.DER),
